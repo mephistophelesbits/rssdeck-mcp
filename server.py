@@ -28,7 +28,7 @@ RSSDECK_URL = os.getenv("RSSDECK_URL", "http://localhost:3001")
 INTERESTS = [i.strip().lower() for i in os.getenv("INTERESTS", "AI,operations,Malaysia,APAC,business,technology,management").split(",")]
 
 # For backwards compatibility, also check OPML file
-RSSDECK_OPML = os.getenv("RSSDECK_OPML", os.path.join(os.path.dirname(__file__), "../rssdeck/feeds/opml/nova-feeds.opml"))
+RSSDECK_OPML = os.getenv("RSSDECK_OPML", os.path.join(os.path.dirname(__file__), "../rssdeck/feeds/opml/rssdeck-feeds.opml"))
 
 # Default feeds when RSSdeck API not available
 DEFAULT_FEEDS = [
@@ -174,6 +174,12 @@ def parse_opml_feeds(opml_path: str) -> list[dict]:
         # Read file and remove comments
         with open(opml_path, 'r') as f:
             content = f.read()
+        
+        # Handle unescaped & in URLs by replacing & with &amp; outside of tags
+        # First, find all xmlUrl attributes and escape their & properly
+        import re
+        content = re.sub(r'(xmlUrl="[^"]*)&(.*?")', r'\1&amp;\2', content)
+        
         # Remove XML comments
         content = re.sub(r'<!--.*?-->', '', content, flags=re.DOTALL)
         # Remove processing instructions
@@ -183,6 +189,8 @@ def parse_opml_feeds(opml_path: str) -> list[dict]:
         for outline in root.findall(".//outline"):
             xml_url = outline.get("xmlUrl")
             if xml_url:
+                # Unescape the &amp; back to & for the URL
+                xml_url = xml_url.replace('&amp;', '&')
                 feeds.append({
                     "name": outline.get("text", outline.get("title", "Unknown")),
                     "url": xml_url,
