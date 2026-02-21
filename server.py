@@ -8,6 +8,7 @@ import os
 import asyncio
 import hashlib
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from typing import Optional
 from dataclasses import dataclass, field
@@ -25,6 +26,7 @@ load_dotenv()
 # Config
 RSSDECK_URL = os.getenv("RSSDECK_URL", "http://localhost:3001")
 INTERESTS = [i.strip().lower() for i in os.getenv("INTERESTS", "AI,operations,Malaysia,APAC,business,technology,management").split(",")]
+RSSDECK_OPML = os.getenv("RSSDECK_OPML", os.path.join(os.path.dirname(__file__), "../rssdeck/feeds/opml/nova-feeds.opml"))
 
 # In-memory cache
 # Default feeds (fallback when RSSdeck API not available)
@@ -141,7 +143,7 @@ def extract_sentiment(title: str, summary: str) -> str:
         return "bearish"
     return "neutral"
 
-def generate_tldr(article: dict) -> str:
+def extract_tldr(article: dict) -> str:
     """Generate TL;DR summary"""
     summary = article.get("summary", "")
     title = article.get("title", "")
@@ -155,18 +157,42 @@ def generate_tldr(article: dict) -> str:
     
     return tldr
 
+def parse_opml_feeds(opml_path: str) -> list[dict]:
+    """Parse OPML file and return list of feeds"""
+    feeds = []
+    try:
+        # Read file and remove comments
+        with open(opml_path, 'r') as f:
+            content = f.read()
+        # Remove XML comments
+        content = re.sub(r'<!--.*?-->', '', content, flags=re.DOTALL)
+        # Remove processing instructions
+        content = re.sub(r'<\?.*?\?>', '', content)
+        
+        root = ET.fromstring(content)
+        for outline in root.findall(".//outline"):
+            xml_url = outline.get("xmlUrl")
+            if xml_url:
+                feeds.append({
+                    "name": outline.get("text", outline.get("title", "Unknown")),
+                    "url": xml_url,
+                })
+    except Exception as e:
+        print(f"Error parsing OPML: {e}")
+        # Fallback feeds
+        feeds = [
+            {"name": "Hacker News", "url": "https://hnrss.org/frontpage"},
+            {"name": "Simon Willison", "url": "https://simonwillison.net/atom/everything/"},
+        ]
+    return feeds
+
 async def refresh_cache():
-    """Refresh article cache from RSSdeck"""
-    # Fetch from RSSdeck API or direct feeds
-    # For now, use some default feeds
-    feeds = [
-        "https://hnrss.org/frontpage",
-        "https://simonwillison.net/atom/everything/",
-        "https://www.technologyreview.com/feed/",
-    ]
+    """Refresh article cache from RSSdeck via OPML"""
+    # Get feeds from OPML
+    feed_list = parse_opml_feeds(RSSDECK_OPML)
     
-    for feed_url in feeds:
-        articles = await fetch_rss(feed_url)
+    for feed in feed_list:
+        articles = await fetch_rss(feed["url"])
         for a in articles:
             article = Article(
                 id=a["id"],
@@ -232,12 +258,11 @@ async def list_tools() -> list[Tool]:
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name == "get_feeds":
+        feed_list = parse_opml_feeds(RSSDECK_OPML)
         return [TextContent(type="text", text=json.dumps({
-            "feeds": [
-                {"name": "Hacker News", "url": "https://hnrss.org/frontpage"},
-                {"name": "Simon Willison", "url": "https://simonwillison.net/atom/everything/"}
-            ],
-            "interests": INTERESTS
+            "feeds": feed_list,
+            "interests": INTERESTS,
+            "source": "OPML"
         }))]
     
     elif name == "get_updates":
