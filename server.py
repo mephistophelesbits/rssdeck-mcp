@@ -1,0 +1,338 @@
+"""
+RSSdeck V2 - MCP Server for AI Agents
+
+A token-efficient RSS service designed for AI agents.
+"""
+
+import os
+import asyncio
+import hashlib
+import re
+from datetime import datetime, timedelta
+from typing import Optional
+from dataclasses import dataclass, field
+from dotenv import load_dotenv
+import httpx
+import feedparser
+from bs4 import BeautifulSoup
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import Tool, TextContent
+import json
+
+load_dotenv()
+
+# Config
+RSSDECK_URL = os.getenv("RSSDECK_URL", "http://localhost:3001")
+INTERESTS = [i.strip().lower() for i in os.getenv("INTERESTS", "AI,operations,Malaysia,APAC,business,technology,management").split(",")]
+
+# In-memory cache
+# Default feeds (fallback when RSSdeck API not available)
+@dataclass
+class Article:
+    id: str
+    title: str
+    link: str
+    summary: str
+    published: str
+    source: str
+    content: str = ""
+    sentiment: str = "neutral"
+    relevance_score: float = 0.0
+
+class ArticleCache:
+    def __init__(self):
+        self.articles: dict[str, Article] = {}
+        self.seen_ids: set[str] = set()
+    
+    def add(self, article: Article):
+        self.articles[article.id] = article
+    
+    def get_all(self):
+        return list(self.articles.values())
+    
+    def get_new(self, since_hours=24):
+        cutoff = datetime.now() - timedelta(hours=since_hours)
+        result = []
+        for a in self.articles.values():
+            try:
+                # Try multiple date formats
+                published_dt = None
+                for fmt in ["%Y-%m-%dT%H:%M:%S", "%a, %d %b %Y %H:%M:%S %z", "%Y-%m-%d %H:%M:%S"]:
+                    try:
+                        published_dt = datetime.strptime(a.published, fmt)
+                        break
+                    except:
+                        continue
+                
+                if published_dt and published_dt > cutoff:
+                    result.append(a)
+            except:
+                # If date parsing fails, include it anyway
+                result.append(a)
+        return result
+    
+    def deduplicate(self):
+        """Remove duplicate stories based on title similarity"""
+        seen_titles = set()
+        unique = []
+        for a in self.articles.values():
+            title_norm = a.title.lower().strip()
+            if title_norm not in seen_titles:
+                seen_titles.add(title_norm)
+                unique.append(a)
+        return unique
+
+cache = ArticleCache()
+
+async def fetch_rss(url: str) -> list[dict]:
+    """Fetch and parse RSS feed"""
+    try:
+        response = httpx.get(url, timeout=10)
+        response.raise_for_status()
+        feed = feedparser.parse(response.text)
+        
+        articles = []
+        for entry in feed.entries[:10]:  # Limit to 10 per feed
+            # Generate ID from URL or title
+            entry_id = hashlib.md5(entry.link.encode()).hexdigest() if hasattr(entry, 'link') else hashlib.md5(entry.title.encode()).hexdigest()
+            
+            summary = entry.get("summary", entry.get("description", ""))
+            # Clean HTML
+            summary = re.sub(r'<[^>]+>', '', summary)[:200]
+            
+            article = {
+                "id": entry_id,
+                "title": entry.title,
+                "link": entry.link,
+                "summary": summary,
+                "published": entry.get("published", datetime.now().isoformat()),
+                "source": feed.feed.get("title", "Unknown"),
+                "content": entry.get("content", [{"value": ""}])[0].value if entry.get("content") else ""
+            }
+            articles.append(article)
+        
+        return articles
+    except Exception as e:
+        print(f"Error fetching {url}: {e}")
+        return []
+
+def calculate_relevance(title: str, summary: str) -> float:
+    """Calculate relevance score based on interests"""
+    text = f"{title} {summary}".lower()
+    score = 0.0
+    for interest in INTERESTS:
+        if interest.lower() in text:
+            score += 1.0
+    return min(score / len(INTERESTS), 1.0)
+
+def extract_sentiment(title: str, summary: str) -> str:
+    """Simple sentiment analysis"""
+    text = f"{title} {summary}".lower()
+    positive = ["up", "growth", "success", "new", "launch", "release", "improve", "best", "win"]
+    negative = ["fail", "crash", "bug", "vulnerability", "hack", "down", "lose", "problem", "issue"]
+    
+    pos_count = sum(1 for p in positive if p in text)
+    neg_count = sum(1 for n in negative if n in text)
+    
+    if pos_count > neg_count:
+        return "bullish"
+    elif neg_count > pos_count:
+        return "bearish"
+    return "neutral"
+
+def generate_tldr(article: dict) -> str:
+    """Generate TL;DR summary"""
+    summary = article.get("summary", "")
+    title = article.get("title", "")
+    
+    # Simple extraction - in production, use LLM
+    sentences = summary.split(". ")
+    if len(sentences) >= 2:
+        tldr = f"{sentences[0]}. {sentences[1][:100]}..."
+    else:
+        tldr = summary[:150] + "..."
+    
+    return tldr
+
+async def refresh_cache():
+    """Refresh article cache from RSSdeck"""
+    # Fetch from RSSdeck API or direct feeds
+    # For now, use some default feeds
+    feeds = [
+        "https://hnrss.org/frontpage",
+        "https://simonwillison.net/atom/everything/",
+        "https://www.technologyreview.com/feed/",
+    ]
+    
+    for feed_url in feeds:
+        articles = await fetch_rss(feed_url)
+        for a in articles:
+            article = Article(
+                id=a["id"],
+                title=a["title"],
+                link=a["link"],
+                summary=a["summary"],
+                published=a["published"],
+                source=a["source"],
+                relevance_score=calculate_relevance(a["title"], a["summary"]),
+                sentiment=extract_sentiment(a["title"], a["summary"])
+            )
+            cache.add(article)
+
+# MCP Server setup
+app = Server("rssdeck-v2")
+
+@app.list_tools()
+async def list_tools() -> list[Tool]:
+    return [
+        Tool(
+            name="get_feeds",
+            description="List all configured RSS feeds",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        Tool(
+            name="get_updates",
+            description="Get latest articles with summaries. Returns token-efficient summaries, not full articles.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "hours": {"type": "number", "default": 24, "description": "Hours to look back"},
+                    "interest_filter": {"type": "string", "default": "", "description": "Filter by interest"},
+                    "max_results": {"type": "number", "default": 10, "description": "Max articles to return"}
+                }
+            }
+        ),
+        Tool(
+            name="search",
+            description="Search across cached articles",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "max_results": {"type": "number", "default": 5}
+                }
+            }
+        ),
+        Tool(
+            name="get_summary",
+            description="Get detailed summary of a specific article",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "article_id": {"type": "string", "description": "Article ID"}
+                }
+            }
+        )
+    ]
+
+@app.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    if name == "get_feeds":
+        return [TextContent(type="text", text=json.dumps({
+            "feeds": [
+                {"name": "Hacker News", "url": "https://hnrss.org/frontpage"},
+                {"name": "Simon Willison", "url": "https://simonwillison.net/atom/everything/"}
+            ],
+            "interests": INTERESTS
+        }))]
+    
+    elif name == "get_updates":
+        await refresh_cache()
+        
+        hours = arguments.get("hours", 24)
+        interest_filter = arguments.get("interest_filter", "")
+        max_results = arguments.get("max_results", 10)
+        
+        # Get new articles
+        articles = cache.get_new(hours)
+        
+        # Deduplicate
+        articles = cache.deduplicate()
+        
+        # Filter by interest
+        if interest_filter:
+            articles = [a for a in articles if interest_filter.lower() in f"{a.title} {a.summary}".lower()]
+        
+        # Sort by relevance
+        articles.sort(key=lambda x: x.relevance_score, reverse=True)
+        
+        # Limit
+        articles = articles[:max_results]
+        
+        results = []
+        for a in articles:
+            results.append({
+                "id": a.id,
+                "title": a.title,
+                "source": a.source,
+                "published": a.published,
+                "tldr": generate_tldr({"title": a.title, "summary": a.summary}),
+                "sentiment": a.sentiment,
+                "relevance": a.relevance_score,
+                "url": a.link
+            })
+        
+        return [TextContent(type="text", text=json.dumps({
+            "count": len(results),
+            "articles": results,
+            "token_tip": "These are TL;DR summaries, not full articles. Use get_summary for details."
+        }))]
+    
+    elif name == "search":
+        query = arguments.get("query", "").lower()
+        max_results = arguments.get("max_results", 5)
+        
+        results = []
+        for a in cache.get_all():
+            if query in a.title.lower() or query in a.summary.lower():
+                results.append({
+                    "id": a.id,
+                    "title": a.title,
+                    "source": a.source,
+                    "tldr": generate_tldr({"title": a.title, "summary": a.summary}),
+                    "url": a.link
+                })
+        
+        results = results[:max_results]
+        
+        return [TextContent(type="text", text=json.dumps({
+            "query": query,
+            "count": len(results),
+            "results": results
+        }))]
+    
+    elif name == "get_summary":
+        article_id = arguments.get("article_id", "")
+        article = cache.articles.get(article_id)
+        
+        if not article:
+            return [TextContent(type="text", text=json.dumps({"error": "Article not found"}))]
+        
+        return [TextContent(type="text", text=json.dumps({
+            "id": article.id,
+            "title": article.title,
+            "source": article.source,
+            "published": article.published,
+            "summary": article.summary,
+            "sentiment": article.sentiment,
+            "relevance": article.relevance_score,
+            "url": article.link,
+            "token_note": "Full summary provided. For shorter version, use get_updates."
+        }))]
+    
+    return [TextContent(type="text", text=json.dumps({"error": "Unknown tool"}))]
+
+async def main():
+    async with stdio_server() as (read_stream, write_stream):
+        await app.run(
+            read_stream,
+            write_stream,
+            app.create_initialization_options()
+        )
+
+if __name__ == "__main__":
+    asyncio.run(main())
