@@ -26,7 +26,17 @@ load_dotenv()
 # Config
 RSSDECK_URL = os.getenv("RSSDECK_URL", "http://localhost:3001")
 INTERESTS = [i.strip().lower() for i in os.getenv("INTERESTS", "AI,operations,Malaysia,APAC,business,technology,management").split(",")]
+
+# For backwards compatibility, also check OPML file
 RSSDECK_OPML = os.getenv("RSSDECK_OPML", os.path.join(os.path.dirname(__file__), "../rssdeck/feeds/opml/nova-feeds.opml"))
+
+# Default feeds when RSSdeck API not available
+DEFAULT_FEEDS = [
+    {"name": "Hacker News", "url": "https://hnrss.org/frontpage"},
+    {"name": "Simon Willison", "url": "https://simonwillison.net/atom/everything/"},
+    {"name": "TechCrunch", "url": "https://techcrunch.com/feed/"},
+    {"name": "MIT Tech Review", "url": "https://www.technologyreview.com/feed/"},
+]
 
 # In-memory cache
 # Default feeds (fallback when RSSdeck API not available)
@@ -186,9 +196,15 @@ def parse_opml_feeds(opml_path: str) -> list[dict]:
         ]
     return feeds
 
+async def get_feeds_from_rssdeck() -> list[dict]:
+    """Get feeds from RSSdeck via API - for future use when frontend passes feeds"""
+    # This would be called by frontend passing feeds directly
+    # For now, we use DEFAULT_FEEDS or OPML
+    return DEFAULT_FEEDS
+
 async def refresh_cache():
-    """Refresh article cache from RSSdeck via OPML"""
-    # Get feeds from OPML
+    """Refresh article cache from RSSdeck"""
+    # Try to get feeds from OPML first (what we have now)
     feed_list = parse_opml_feeds(RSSDECK_OPML)
     
     for feed in feed_list:
