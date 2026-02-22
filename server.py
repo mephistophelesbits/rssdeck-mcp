@@ -21,6 +21,13 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 import json
 
+# Local imports
+from rss_db import (
+    add_feed, get_all_feeds, store_article, store_articles,
+    get_articles, search_articles, get_sentiment_breakdown,
+    get_top_sources, generate_rss_report
+)
+
 load_dotenv()
 
 # Config
@@ -215,8 +222,16 @@ async def refresh_cache():
     # Try to get feeds from OPML first (what we have now)
     feed_list = parse_opml_feeds(RSSDECK_OPML)
     
+    # Track feeds in database
+    for feed in feed_list:
+        add_feed(feed["name"], feed["url"])
+    
     for feed in feed_list:
         articles = await fetch_rss(feed["url"])
+        
+        # Store in database
+        store_articles(articles)
+        
         for a in articles:
             article = Article(
                 id=a["id"],
@@ -375,7 +390,26 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     
     return [TextContent(type="text", text=json.dumps({"error": "Unknown tool"}))]
 
+async def background_refresh():
+    """Background task to refresh RSS every 2 hours"""
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    while True:
+        try:
+            logger.info("Background: Refreshing RSS feeds...")
+            await refresh_cache()
+            logger.info("Background: Refresh complete. Sleeping for 2 hours.")
+        except Exception as e:
+            logger.error(f"Background refresh error: {e}")
+        
+        await asyncio.sleep(2 * 60 * 60)  # 2 hours
+
 async def main():
+    # Start background refresh task
+    refresh_task = asyncio.create_task(background_refresh())
+    
     async with stdio_server() as (read_stream, write_stream):
         await app.run(
             read_stream,
