@@ -10,23 +10,17 @@ import hashlib
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-from typing import Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from dotenv import load_dotenv
 import httpx
 import feedparser
-from bs4 import BeautifulSoup
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 import json
 
 # Local imports
-from rss_db import (
-    add_feed, get_all_feeds, store_article, store_articles,
-    get_articles, search_articles, get_sentiment_breakdown,
-    get_top_sources, generate_rss_report
-)
+from rss_db import add_feed, store_articles
 
 load_dotenv()
 
@@ -46,7 +40,6 @@ DEFAULT_FEEDS = [
 ]
 
 # In-memory cache
-# Default feeds (fallback when RSSdeck API not available)
 @dataclass
 class Article:
     id: str
@@ -63,13 +56,13 @@ class ArticleCache:
     def __init__(self):
         self.articles: dict[str, Article] = {}
         self.seen_ids: set[str] = set()
-    
+
     def add(self, article: Article):
         self.articles[article.id] = article
-    
+
     def get_all(self):
         return list(self.articles.values())
-    
+
     def get_new(self, since_hours=24):
         cutoff = datetime.now() - timedelta(hours=since_hours)
         result = []
@@ -83,14 +76,14 @@ class ArticleCache:
                         break
                     except:
                         continue
-                
+
                 if published_dt and published_dt > cutoff:
                     result.append(a)
             except:
                 # If date parsing fails, include it anyway
                 result.append(a)
         return result
-    
+
     def deduplicate(self):
         """Remove duplicate stories based on title similarity"""
         seen_titles = set()
@@ -110,16 +103,16 @@ async def fetch_rss(url: str) -> list[dict]:
         response = httpx.get(url, timeout=10)
         response.raise_for_status()
         feed = feedparser.parse(response.text)
-        
+
         articles = []
         for entry in feed.entries[:10]:  # Limit to 10 per feed
             # Generate ID from URL or title
             entry_id = hashlib.md5(entry.link.encode()).hexdigest() if hasattr(entry, 'link') else hashlib.md5(entry.title.encode()).hexdigest()
-            
+
             summary = entry.get("summary", entry.get("description", ""))
             # Clean HTML
             summary = re.sub(r'<[^>]+>', '', summary)[:200]
-            
+
             article = {
                 "id": entry_id,
                 "title": entry.title,
@@ -130,7 +123,7 @@ async def fetch_rss(url: str) -> list[dict]:
                 "content": entry.get("content", [{"value": ""}])[0].value if entry.get("content") else ""
             }
             articles.append(article)
-        
+
         return articles
     except Exception as e:
         print(f"Error fetching {url}: {e}")
@@ -150,10 +143,10 @@ def extract_sentiment(title: str, summary: str) -> str:
     text = f"{title} {summary}".lower()
     positive = ["up", "growth", "success", "new", "launch", "release", "improve", "best", "win"]
     negative = ["fail", "crash", "bug", "vulnerability", "hack", "down", "lose", "problem", "issue"]
-    
+
     pos_count = sum(1 for p in positive if p in text)
     neg_count = sum(1 for n in negative if n in text)
-    
+
     if pos_count > neg_count:
         return "bullish"
     elif neg_count > pos_count:
@@ -163,15 +156,14 @@ def extract_sentiment(title: str, summary: str) -> str:
 def extract_tldr(article: dict) -> str:
     """Generate TL;DR summary"""
     summary = article.get("summary", "")
-    title = article.get("title", "")
-    
+
     # Simple extraction - in production, use LLM
     sentences = summary.split(". ")
     if len(sentences) >= 2:
         tldr = f"{sentences[0]}. {sentences[1][:100]}..."
     else:
         tldr = summary[:150] + "..."
-    
+
     return tldr
 
 def parse_opml_feeds(opml_path: str) -> list[dict]:
@@ -181,17 +173,16 @@ def parse_opml_feeds(opml_path: str) -> list[dict]:
         # Read file and remove comments
         with open(opml_path, 'r') as f:
             content = f.read()
-        
+
         # Handle unescaped & in URLs by replacing & with &amp; outside of tags
         # First, find all xmlUrl attributes and escape their & properly
-        import re
         content = re.sub(r'(xmlUrl="[^"]*)&(.*?")', r'\1&amp;\2', content)
-        
+
         # Remove XML comments
         content = re.sub(r'<!--.*?-->', '', content, flags=re.DOTALL)
         # Remove processing instructions
         content = re.sub(r'<\?.*?\?>', '', content)
-        
+
         root = ET.fromstring(content)
         for outline in root.findall(".//outline"):
             xml_url = outline.get("xmlUrl")
@@ -212,26 +203,42 @@ def parse_opml_feeds(opml_path: str) -> list[dict]:
     return feeds
 
 async def get_feeds_from_rssdeck() -> list[dict]:
-    """Get feeds from RSSdeck via API - for future use when frontend passes feeds"""
-    # This would be called by frontend passing feeds directly
-    # For now, we use DEFAULT_FEEDS or OPML
-    return DEFAULT_FEEDS
+    """Get feeds from RSSdeck live API (GET /api/deck/feeds/opml), returns list of {name, url}"""
+    try:
+        response = httpx.get(f"{RSSDECK_URL}/api/deck/feeds/opml", timeout=5)
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+        feeds = []
+        for outline in root.findall(".//outline"):
+            xml_url = outline.get("xmlUrl")
+            if xml_url:
+                feeds.append({
+                    "name": outline.get("text", outline.get("title", "Unknown")),
+                    "url": xml_url,
+                })
+        if feeds:
+            return feeds
+    except Exception as e:
+        print(f"RSSdeck API unavailable ({e}), falling back to OPML file")
+    return []
 
 async def refresh_cache():
     """Refresh article cache from RSSdeck"""
-    # Try to get feeds from OPML first (what we have now)
-    feed_list = parse_opml_feeds(RSSDECK_OPML)
-    
+    # Try live RSSdeck API first, then fall back to OPML file
+    feed_list = await get_feeds_from_rssdeck()
+    if not feed_list:
+        feed_list = parse_opml_feeds(RSSDECK_OPML)
+
     # Track feeds in database
     for feed in feed_list:
         add_feed(feed["name"], feed["url"])
-    
+
     for feed in feed_list:
         articles = await fetch_rss(feed["url"])
-        
+
         # Store in database
         store_articles(articles)
-        
+
         for a in articles:
             article = Article(
                 id=a["id"],
@@ -297,36 +304,38 @@ async def list_tools() -> list[Tool]:
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name == "get_feeds":
-        feed_list = parse_opml_feeds(RSSDECK_OPML)
+        feed_list = await get_feeds_from_rssdeck()
+        if not feed_list:
+            feed_list = parse_opml_feeds(RSSDECK_OPML)
         return [TextContent(type="text", text=json.dumps({
             "feeds": feed_list,
             "interests": INTERESTS,
-            "source": "OPML"
+            "source": "live" if feed_list else "OPML"
         }))]
-    
+
     elif name == "get_updates":
         await refresh_cache()
-        
+
         hours = arguments.get("hours", 24)
         interest_filter = arguments.get("interest_filter", "")
         max_results = arguments.get("max_results", 10)
-        
+
         # Get new articles
         articles = cache.get_new(hours)
-        
+
         # Deduplicate
         articles = cache.deduplicate()
-        
+
         # Filter by interest
         if interest_filter:
             articles = [a for a in articles if interest_filter.lower() in f"{a.title} {a.summary}".lower()]
-        
+
         # Sort by relevance
         articles.sort(key=lambda x: x.relevance_score, reverse=True)
-        
+
         # Limit
         articles = articles[:max_results]
-        
+
         results = []
         for a in articles:
             results.append({
@@ -334,22 +343,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "title": a.title,
                 "source": a.source,
                 "published": a.published,
-                "tldr": generate_tldr({"title": a.title, "summary": a.summary}),
+                "tldr": extract_tldr({"title": a.title, "summary": a.summary}),
                 "sentiment": a.sentiment,
                 "relevance": a.relevance_score,
                 "url": a.link
             })
-        
+
         return [TextContent(type="text", text=json.dumps({
             "count": len(results),
             "articles": results,
             "token_tip": "These are TL;DR summaries, not full articles. Use get_summary for details."
         }))]
-    
+
     elif name == "search":
         query = arguments.get("query", "").lower()
         max_results = arguments.get("max_results", 5)
-        
+
         results = []
         for a in cache.get_all():
             if query in a.title.lower() or query in a.summary.lower():
@@ -357,25 +366,25 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "id": a.id,
                     "title": a.title,
                     "source": a.source,
-                    "tldr": generate_tldr({"title": a.title, "summary": a.summary}),
+                    "tldr": extract_tldr({"title": a.title, "summary": a.summary}),
                     "url": a.link
                 })
-        
+
         results = results[:max_results]
-        
+
         return [TextContent(type="text", text=json.dumps({
             "query": query,
             "count": len(results),
             "results": results
         }))]
-    
+
     elif name == "get_summary":
         article_id = arguments.get("article_id", "")
         article = cache.articles.get(article_id)
-        
+
         if not article:
             return [TextContent(type="text", text=json.dumps({"error": "Article not found"}))]
-        
+
         return [TextContent(type="text", text=json.dumps({
             "id": article.id,
             "title": article.title,
@@ -387,7 +396,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "url": article.link,
             "token_note": "Full summary provided. For shorter version, use get_updates."
         }))]
-    
+
     return [TextContent(type="text", text=json.dumps({"error": "Unknown tool"}))]
 
 async def background_refresh():
@@ -395,7 +404,7 @@ async def background_refresh():
     import logging
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
-    
+
     while True:
         try:
             logger.info("Background: Refreshing RSS feeds...")
@@ -403,13 +412,13 @@ async def background_refresh():
             logger.info("Background: Refresh complete. Sleeping for 2 hours.")
         except Exception as e:
             logger.error(f"Background refresh error: {e}")
-        
+
         await asyncio.sleep(2 * 60 * 60)  # 2 hours
 
 async def main():
     # Start background refresh task
-    refresh_task = asyncio.create_task(background_refresh())
-    
+    asyncio.create_task(background_refresh())
+
     async with stdio_server() as (read_stream, write_stream):
         await app.run(
             read_stream,
